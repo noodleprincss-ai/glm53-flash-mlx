@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -307,6 +308,23 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(out)
 
 
+@dataclass
+class _IndexerPoolState:
+    """Exact, source-bound pool state retained on a single-stream KV cache.
+
+    Pool keys/indices are query-independent. The source array reference and
+    sequence length make reuse fail closed after state replacement, trim,
+    extraction, batching, or rotation. Query scores and selected keys are
+    deliberately never stored here.
+    """
+
+    keys: mx.array
+    indices: mx.array
+    valid: mx.array
+    sequence_length: int
+    source_keys: mx.array
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -395,6 +413,12 @@ class Glm5NextIndexer(nn.Module):
         packed = mx.concatenate(
             [k, gate_scores, valid_cur.astype(k.dtype)[..., None]], axis=-1
         )
+        # Capture the pre-append identity/length. A KVCache keeps the same array
+        # object for ordinary in-capacity appends; replacing/restoring/extracting
+        # cache state changes it. Checking before update also permits safe reuse
+        # when this append itself grows the backing allocation.
+        previous_keys = cache.keys if type(cache) is KVCache else None
+        previous_length = cache.offset if type(cache) is KVCache else None
         if cache is not None:
             keys, _ = cache.update_and_fetch(packed[:, None], mx.zeros((B, 1, S, 0)))
             packed_full = keys[:, 0]
@@ -416,31 +440,36 @@ class Glm5NextIndexer(nn.Module):
         kv_len = T
         kv_pos = mx.arange(T)
 
-        # Incremental pooling at decode: complete pools are stable across steps, so
-        # recompute only the suffix (last partial pool + any new pool) and reuse the
-        # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
-        # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cached pool's batch axis no longer matches the current batch. That last
-        # guard matters under continuous batching: BatchGenerator grows/shrinks the
-        # batch (extend/filter) on the batch axis but does not carry this per-cache
-        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
-        if (
-            S == 1
-            and cache is not None
-            and getattr(cache, "_pool", None) is not None
+        # Complete all-valid pools are invariant under an append. Reuse their
+        # query-independent state for both decode and later prefill chunks, and
+        # recompute only the previous 0..kpool-1 token tail plus the new suffix.
+        # Never cache scores/order/selected keys: those depend on each query and its
+        # causal visibility. The narrow eligibility contract intentionally rejects
+        # batches, padding, foreign/rotating caches, restored/replaced state, trims,
+        # and forks; each falls back to an exact full rebuild for this transition.
+        state = getattr(cache, "_pool", None) if cache is not None else None
+        reusable = (
+            type(cache) is KVCache
+            and B == 1
+            and isinstance(state, _IndexerPoolState)
             and getattr(cache, "_no_pad", False)
-            and cache._pool[0].shape[0] == B
-        ):
-            ck, ci, cv, t_prev = cache._pool
-            n_stable = t_prev // self.index_kpool
+            and state.keys.shape[0] == B
+            and state.sequence_length == previous_length
+            and state.sequence_length == T - S
+            and state.source_keys is previous_keys
+        )
+        if reusable:
+            n_stable = state.sequence_length // self.index_kpool
             s0 = n_stable * self.index_kpool
             pk_s, pi_s, pv_s = self._pooled_states(
                 k_full[:, s0:], gate_full[:, s0:], valid[:, s0:]
             )
             pi_s = mx.where(pi_s >= 0, pi_s + s0, -1)
-            pool_keys = mx.concatenate([ck[:, :n_stable], pk_s], axis=1)
-            pool_indices = mx.concatenate([ci[:, :n_stable], pi_s], axis=1)
-            pool_valid = mx.concatenate([cv[:, :n_stable], pv_s], axis=1)
+            pool_keys = mx.concatenate([state.keys[:, :n_stable], pk_s], axis=1)
+            pool_indices = mx.concatenate(
+                [state.indices[:, :n_stable], pi_s], axis=1
+            )
+            pool_valid = mx.concatenate([state.valid[:, :n_stable], pv_s], axis=1)
         else:
             pool_keys, pool_indices, pool_valid = self._pooled_states(
                 k_full, gate_full, valid
@@ -448,7 +477,9 @@ class Glm5NextIndexer(nn.Module):
             if cache is not None:
                 cache._no_pad = bool(mx.all(valid))
         if cache is not None:
-            cache._pool = (pool_keys, pool_indices, pool_valid, T)
+            cache._pool = _IndexerPoolState(
+                pool_keys, pool_indices, pool_valid, T, cache.keys
+            )
         P = pool_keys.shape[1]
         select_k = min(self.index_topk // self.index_kpool, P)
         pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
