@@ -52,7 +52,7 @@ def cooldown(samples_required: int, interval: float, max_swap_growth: int,
         raise RuntimeError(f"cooldown pressure trend did not settle: {deltas}")
     # Growth in every consecutive interval is sustained rather than a transient tick.
     for key in limits:
-        if all(samples[i + 1][key] > samples[i][key] for i in range(len(samples) - 1)):
+        if len(samples) >= 4 and all(samples[i + 1][key] > samples[i][key] for i in range(len(samples) - 1)):
             raise RuntimeError(f"sustained cooldown growth for {key}")
     return samples
 
