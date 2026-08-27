@@ -174,6 +174,50 @@ def recurrent_kimi_delta(
     return out, state
 
 
+_KDA_SHORT_CONV_STEP_SOURCE = r"""
+    uint c = thread_position_in_grid.x;
+    uint b = thread_position_in_grid.y;
+    if (c >= C || b >= B) return;
+
+    const device T* s = state + b * 3 * C;
+    const device T* wb = weight + c * 4;
+    float acc = (float)wb[0] * (float)s[c]
+              + (float)wb[1] * (float)s[C + c]
+              + (float)wb[2] * (float)s[2 * C + c]
+              + (float)wb[3] * (float)x[b * C + c];
+    y[b * C + c] = (T)(acc / (1.0f + metal::exp(-acc)));
+
+    device T* ns = new_state + b * 3 * C;
+    ns[c] = s[C + c];
+    ns[C + c] = s[2 * C + c];
+    ns[2 * C + c] = x[b * C + c];
+"""
+
+_KDA_SHORT_CONV_STEP = (
+    mx.fast.metal_kernel(
+        name="glm53_kda_short_conv_step",
+        input_names=["x", "state", "weight"],
+        output_names=["y", "new_state"],
+        source=_KDA_SHORT_CONV_STEP_SOURCE,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
+
+def _kda_short_conv_step(x: mx.array, state: mx.array, weight: mx.array):
+    """Fused exact-shape KDA decode convolution and rolling-state update."""
+    B, _, C = x.shape
+    return _KDA_SHORT_CONV_STEP(
+        inputs=[x, state, weight.reshape(-1)],
+        template=[("T", x.dtype), ("B", B), ("C", C)],
+        grid=(C, B, 1),
+        threadgroup=(min(256, C), 1, 1),
+        output_shapes=[x.shape, state.shape],
+        output_dtypes=[x.dtype, state.dtype],
+    )
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -204,6 +248,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = Glm5NextRMSNormGated(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
         self.fuse_in = True
+        self.fuse_short_conv_decode = True
         self._fused_ready = False
 
     def _fused_in_proj(self, inputs):
@@ -270,10 +315,39 @@ class Glm5NextLinearAttention(nn.Module):
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
             )
-        conv_input = mx.concatenate([conv_state, mixed], axis=1)
-        if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        use_fused_short_conv = (
+            self.fuse_short_conv_decode
+            and _KDA_SHORT_CONV_STEP is not None
+            and not self.training
+            and cache is not None
+            and cache[0] is not None
+            and B == 1
+            and S == 1
+            and self.conv_kernel_size == 4
+            and mixed.shape == (1, 1, self.conv_dim)
+            and conv_state.shape == (1, 3, self.conv_dim)
+            and self.conv1d.weight.shape == (self.conv_dim, 4, 1)
+            and mask is None
+            and mixed.dtype == conv_state.dtype == self.conv1d.weight.dtype
+            and mixed.dtype in (mx.bfloat16, mx.float16, mx.float32)
+            and mx.default_device() == mx.gpu
+        )
+        if use_fused_short_conv:
+            # `mixed` is a concatenate result and cache state is created by either
+            # mx.contiguous below or this kernel. Reassert the dense layout before
+            # entering the pointer-indexed custom kernel.
+            conv_out, cache[0] = _kda_short_conv_step(
+                mx.contiguous(mixed),
+                mx.contiguous(conv_state),
+                self.conv1d.weight,
+            )
+        else:
+            conv_input = mx.concatenate([conv_state, mixed], axis=1)
+            if cache is not None:
+                cache[0] = mx.contiguous(
+                    conv_input[:, -(self.conv_kernel_size - 1) :, :]
+                )
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
         q = q.reshape(B, S, self.num_heads, self.head_dim)

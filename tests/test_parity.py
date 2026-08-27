@@ -178,6 +178,54 @@ def main():
     b_ = np.array(model.language_model(mx.array(ids[:, 5:].numpy()), cache=cache).logits.astype(mx.float32))
     all_ok &= report("chunked prefill 5+7 vs single-shot", np.concatenate([a, b_], 1), logits_mlx(model, ids))
 
+    print("[6] KDA fused L=1 path vs parent through 258 recurrent tokens")
+    one_ids = ((torch.arange(270)[None] % (TEXT["vocab_size"] - 2)) + 2).long()
+    linear = [layer.self_attn for layer in model.language_model.model.layers if layer.is_linear]
+
+    def recurrent_run(fused, chunks):
+        for attn in linear:
+            attn.fuse_short_conv_decode = fused
+        c = model.language_model.make_cache()
+        out = []
+        pos = 0
+        for size in chunks:
+            z = model.language_model(
+                mx.array(one_ids[:, pos : pos + size].numpy()), cache=c
+            ).logits
+            mx.eval(z)
+            out.append(np.array(z.astype(mx.float32)))
+            pos += size
+        transition = [
+            (np.array(x[0].astype(mx.float32)), np.array(x[1])) for x in c[:3]
+        ]
+        while pos < one_ids.shape[1]:
+            z = model.language_model(
+                mx.array(one_ids[:, pos : pos + 1].numpy()), cache=c
+            ).logits
+            mx.eval(z)
+            out.append(np.array(z.astype(mx.float32)))
+            pos += 1
+        final = [(np.array(x[0].astype(mx.float32)), np.array(x[1])) for x in c[:3]]
+        return np.concatenate(out, axis=1), transition, final
+
+    parent, parent_transition, parent_final = recurrent_run(False, [7, 5])
+    fused, fused_transition, fused_final = recurrent_run(True, [3, 4, 5])
+    all_ok &= report("270-token logits; prompt remainders 7+5 vs 3+4+5", fused, parent)
+    for phase, lhs, rhs in (
+        ("prefill transition", fused_transition, parent_transition),
+        ("final recurrent", fused_final, parent_final),
+    ):
+        conv_delta = max(float(np.abs(a[0] - b[0]).max()) for a, b in zip(lhs, rhs))
+        delta_delta = max(float(np.abs(a[1] - b[1]).max()) for a, b in zip(lhs, rhs))
+        ok = conv_delta < 2e-6 and delta_delta < 2e-8
+        print(
+            f"  {phase + ' conv/gated-delta state':58s} "
+            f"{conv_delta:.3e}/{delta_delta:.3e}  {'OK' if ok else 'FAIL'}"
+        )
+        all_ok &= ok
+    reused, _, _ = recurrent_run(True, [12])
+    all_ok &= report("reset/new-cache reuse reproduces fused logits", reused, fused)
+
     print("\nALL OK" if all_ok else "\nSOME CHECKS FAILED")
     return 0 if all_ok else 1
 
