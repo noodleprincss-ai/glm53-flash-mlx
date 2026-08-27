@@ -185,7 +185,13 @@ _KDA_SHORT_CONV_STEP_SOURCE = r"""
               + (float)wb[1] * (float)s[C + c]
               + (float)wb[2] * (float)s[2 * C + c]
               + (float)wb[3] * (float)x[b * C + c];
-    y[b * C + c] = (T)(acc / (1.0f + metal::exp(-acc)));
+    // Match the stock graph boundary: Conv1d stores T before SiLU, and
+    // MLX sigmoid uses its stable abs/branch form. Keeping both roundings is
+    // required for exact fp16/bf16 recurrent semantics.
+    T z = (T)acc;
+    auto low = 1 / (1 + metal::exp(metal::abs(z)));
+    T sig = (z < 0) ? low : 1 - low;
+    y[b * C + c] = z * sig;
 
     device T* ns = new_state + b * 3 * C;
     ns[c] = s[C + c];

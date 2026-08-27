@@ -29,6 +29,8 @@ class KdaShortConvKernelTest(unittest.TestCase):
                 self.assertTrue(
                     mx.allclose(actual_y, expected_y, atol=atol, rtol=0).item()
                 )
+                if dtype in (mx.float16, mx.bfloat16):
+                    self.assertTrue(mx.array_equal(actual_y, expected_y).item())
                 self.assertTrue(mx.array_equal(actual_state, expected_state).item())
 
     def test_recurrent_state_matches_parent_for_multiple_steps(self):
