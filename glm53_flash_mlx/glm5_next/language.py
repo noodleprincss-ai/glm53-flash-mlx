@@ -709,6 +709,7 @@ class Glm5NextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        logits_to_keep: Optional[int] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
@@ -731,10 +732,16 @@ class Glm5NextModel(nn.Module):
             h = layer(h, mask=mask, cache=c)
 
         h = h.mean(axis=2)
+        if logits_to_keep:
+            h = h[:, -int(logits_to_keep) :, :]
         return self.norm(h)
 
 
 class LanguageModel(nn.Module):
+    # mlx-vlm generation requests only the terminal prompt logit when a model
+    # advertises this contract. Direct forwards continue to return every logit.
+    supports_logits_to_keep = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -754,12 +761,15 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        # Only the last few positions' logits are ever needed for generation; slicing
-        # before the (vocab-wide) projection skips it on discarded prefill positions.
-        nlk = kwargs.get("num_logits_to_keep", 0)
-        if nlk:
-            out = out[:, -nlk:, :]
+        logits_to_keep = kwargs.pop(
+            "logits_to_keep", kwargs.pop("num_logits_to_keep", None)
+        )
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            logits_to_keep=logits_to_keep,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
