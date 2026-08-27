@@ -385,10 +385,23 @@ class Glm5NextIndexer(nn.Module):
         k = self.k_norm(self.wk(x)).reshape(B, S, self.head_dim)
         gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
 
-        if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
+        explicit_validity = (
+            mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S)
+        )
+        if explicit_validity:
             valid_cur = mask
         else:
             valid_cur = mx.ones((B, S), dtype=mx.bool_)
+
+        # A plain KVCache with an empty history and no explicit validity mask proves
+        # an unpadded stream without reading device data. Once an explicit mask or an
+        # unproven cache appears, stay fail-closed on the generic path for its lifetime.
+        if cache is not None:
+            cache._padding_free = (
+                type(cache) is KVCache
+                and (cache.keys is None or getattr(cache, "_padding_free", False))
+                and not explicit_validity
+            )
 
         # Pack per-token state and append to the indexer cache so pooling/selection
         # run over the full cached sequence -- unifies prefill and incremental decode.
@@ -419,16 +432,16 @@ class Glm5NextIndexer(nn.Module):
         # Incremental pooling at decode: complete pools are stable across steps, so
         # recompute only the suffix (last partial pool + any new pool) and reuse the
         # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
-        # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cached pool's batch axis no longer matches the current batch. That last
-        # guard matters under continuous batching: BatchGenerator grows/shrinks the
-        # batch (extend/filter) on the batch axis but does not carry this per-cache
-        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
+        # Exact; only a concrete KVCache proves single-stream, unpadded history.
+        # BatchKVCache and unknown/subclassed caches fail closed to full pooling even
+        # when their current masks happen to be all true; inspecting those tensor
+        # values on the host would synchronize every active sparse layer. A stale
+        # or batch-incompatible _pool is likewise discarded and rebuilt for one step.
         if (
             S == 1
-            and cache is not None
+            and type(cache) is KVCache
+            and getattr(cache, "_padding_free", False)
             and getattr(cache, "_pool", None) is not None
-            and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
         ):
             ck, ci, cv, t_prev = cache._pool
@@ -445,8 +458,6 @@ class Glm5NextIndexer(nn.Module):
             pool_keys, pool_indices, pool_valid = self._pooled_states(
                 k_full, gate_full, valid
             )
-            if cache is not None:
-                cache._no_pad = bool(mx.all(valid))
         if cache is not None:
             cache._pool = (pool_keys, pool_indices, pool_valid, T)
         P = pool_keys.shape[1]
