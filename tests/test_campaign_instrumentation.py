@@ -9,8 +9,10 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 import unittest
+from unittest.mock import patch
 
 from campaign.instrumented_prefill import PINNED_AR_SHA256, assert_pinned_ar_source, instrumented_prefill
+from campaign.h0_benchmark import consume_lookahead_window
 
 
 def legacy_parity_module():
@@ -138,6 +140,26 @@ class InstrumentationTests(unittest.TestCase):
     def test_source_pin_is_exact(self):
         _, _, digest = assert_pinned_ar_source()
         self.assertEqual(digest, PINNED_AR_SHA256)
+
+    def test_source_pin_rejects_any_other_digest(self):
+        with patch("campaign.instrumented_prefill.PINNED_AR_SHA256", "0" * 64):
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                assert_pinned_ar_source()
+
+    def test_decode_prime_and_flush_count_exactly_128_steps(self):
+        yielded = iter((index, object()) for index in range(137))
+        synchronizations = []
+        clocks = iter((10.0, 10.5, 20.0, 24.0))
+        row = consume_lookahead_window(
+            yielded, 128, lambda: synchronizations.append(True), lambda: next(clocks)
+        )
+        self.assertEqual(row["discarded_yield_indices"], [0, 7])
+        self.assertEqual(row["timed_yield_indices"], [8, 135])
+        self.assertEqual(row["timed_model_step_indices"], [9, 136])
+        self.assertEqual(len(row["timed_token_ids"]), 128)
+        self.assertEqual(row["lookahead_token_index"], 136)
+        self.assertEqual(row["lookahead_token_id_excluded"], 136)
+        self.assertEqual(len(synchronizations), 3)
 
     def test_prefill_matches_public_generate_step_across_chunk_remainders(self):
         # step=4 covers every remainder 0..3 plus an unchunked prompt.
