@@ -66,14 +66,28 @@ def swap_used_bytes(text: str) -> int:
     return int(float(match.group(1)) * (1024 ** (2 if match.group(2) == "M" else 3)))
 
 
+def memory_free_percent(text: str) -> int:
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", text)
+    if not match:
+        raise RuntimeError(f"cannot parse memory_pressure output: {text}")
+    return int(match.group(1))
+
+
 def pressure_snapshot() -> dict[str, Any]:
     swap = command("sysctl", "vm.swapusage")
     vm_text = command("vm_stat")
+    memory_text = command("memory_pressure", "-Q")
     vm = parse_vm_stat(vm_text)
+    rows = process_rows()
+    own = next((row["rss_bytes"] for row in rows if row["pid"] == os.getpid()), 0)
+    other = sum(row["rss_bytes"] for row in rows if row["pid"] != os.getpid())
     return {
         "captured_at_utc": utc_now(), "swapusage": swap, "swap_used_bytes": swap_used_bytes(swap),
         "pageins": vm.get("pageins", 0), "pageouts": vm.get("pageouts", 0),
         "compressor_pages": vm.get("pages_occupied_by_compressor", 0),
+        "memory_pressure": memory_text, "memory_free_percent": memory_free_percent(memory_text),
+        "self_rss_bytes": own, "other_rss_bytes": other, "combined_rss_bytes": own + other,
+        "physical_memory_bytes": int(command("sysctl", "-n", "hw.memsize")),
         "vm_stat": vm_text,
     }
 
@@ -226,7 +240,8 @@ def one_regime(model: Any, tokenizer: Any, length: int, step: int, phase: str,
 
 
 def pressure_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
-    return {key: after[key] - before[key] for key in ("swap_used_bytes", "pageins", "pageouts", "compressor_pages")}
+    return {key: after[key] - before[key] for key in
+            ("swap_used_bytes", "pageins", "pageouts", "compressor_pages", "memory_free_percent")}
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -247,6 +262,7 @@ def main() -> int:
     parser.add_argument("--expected-peak-gb", type=float, default=190.0); parser.add_argument("--rss-sample-seconds", type=float, default=1.0)
     parser.add_argument("--mlx-preferred-gb", type=float, default=205.0); parser.add_argument("--mlx-hard-gb", type=float, default=210.0)
     parser.add_argument("--max-swap-growth-mb", type=float, default=256.0); parser.add_argument("--max-pagein-growth", type=int, default=131072)
+    parser.add_argument("--max-pageout-growth", type=int, default=8192)
     parser.add_argument("--max-compressor-growth", type=int, default=65536)
     args = parser.parse_args()
     minimums = {"smoke": 1, "screen": 3, "acceptance": 5, "confirmation": 5, "reproduction": 1}
@@ -278,6 +294,8 @@ def main() -> int:
                   "host_residency_bytes": int(physical * .90),
                   "max_swap_growth_bytes": int(args.max_swap_growth_mb * 1024**2),
                   "max_pagein_growth": args.max_pagein_growth,
+                  "pageins_role": "telemetry_and_corroboration_only",
+                  "max_pageout_growth": args.max_pageout_growth,
                   "max_compressor_growth": args.max_compressor_growth},
         "before": before, "warmups": [], "runs": [],
     }
@@ -303,7 +321,9 @@ def main() -> int:
                     data.setdefault("counted_pressure", []).append({"length": length, "before": counted_pressure_before,
                         "after": counted_pressure_after, "delta": delta})
                     if delta["swap_used_bytes"] > data["gates"]["max_swap_growth_bytes"]: raise RuntimeError("swap growth gate exceeded")
-                    if delta["pageins"] > args.max_pagein_growth: raise RuntimeError("page-in growth gate exceeded")
+                    # macOS page-ins are a global monotonic activity counter. Retain
+                    # them as telemetry, but never make them a standalone hard gate.
+                    if delta["pageouts"] > args.max_pageout_growth: raise RuntimeError("page-out growth gate exceeded")
                     if delta["compressor_pages"] > args.max_compressor_growth: raise RuntimeError("compressor growth gate exceeded")
             data["resource_sampling"] = sampler.summary(); sampler = None
             if not data["resource_sampling"]["host_residency_gate_passed"]: raise RuntimeError("90% host-residency gate exceeded")
